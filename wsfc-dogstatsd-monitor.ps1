@@ -11,21 +11,6 @@
       * Quorum type, state, witness      -> wsfc.quorum.witness.health (+ tags)
       * Cluster network health           -> wsfc.network.health / wsfc.network.state
       * Cluster network interface health -> wsfc.network_interface.health / wsfc.network_interface.state
-
-    Prerequisites:
-      1. Install-WindowsFeature -Name Failover-Clustering -IncludeManagementTools
-      2. Install-WindowsFeature -Name RSAT-Clustering-PowerShell
-      3. Datadog Agent running with DogStatsD enabled (port 8125)
-      4. Run as Local Administrator
-
-.PARAMETER DogStatsDHost   IP/hostname of DogStatsD listener. Default: 127.0.0.1
-.PARAMETER DogStatsDPort   UDP port of DogStatsD listener.   Default: 8125
-.PARAMETER ComputerName    Remote cluster node to query.     Default: local
-.PARAMETER RunOnce         Single collection cycle then exit (for testing).
-
-.EXAMPLE
-    .\wsfc-dogstatsd-monitor.ps1 -RunOnce -Verbose
-    .\wsfc-dogstatsd-monitor.ps1 -ComputerName NODE02
 #>
 
 [CmdletBinding()]
@@ -39,17 +24,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'
 
-# =============================================================================
-# SECTION 0 - Pre-Flight Checks
-# =============================================================================
-
 function Test-Prerequisites {
     $pass = $true
     Write-Host "`n[Pre-Flight] Checking prerequisites..." -ForegroundColor Cyan
 
     try {
-        $null = Get-CimInstance -Namespace ROOT\MSCluster -ClassName MSCluster_Cluster `
-                                -ErrorAction Stop | Select-Object -First 1
+        $null = Get-CimInstance -Namespace ROOT\MSCluster -ClassName MSCluster_Cluster -ErrorAction Stop | Select-Object -First 1
         Write-Host "  [OK] ROOT\MSCluster WMI namespace is available." -ForegroundColor Green
     }
     catch {
@@ -85,23 +65,13 @@ function Test-Prerequisites {
     return $pass
 }
 
-# =============================================================================
-# SECTION 1 - DogStatsD UDP Helper
-# -----------------------------------------------------------------------------
-# NOTE: Parameter is $Hostname NOT $Host.
-#       $Host is a reserved PowerShell automatic variable — using it causes:
-#       "Cannot overwrite variable Host because it is read-only or constant."
-# =============================================================================
-
 function Initialize-DogStatsDClient {
     param(
         [string] $Hostname,
         [int]    $Port
     )
     $Script:UdpClient         = [System.Net.Sockets.UdpClient]::new()
-    $Script:DogStatsDEndpoint = [System.Net.IPEndPoint]::new(
-        [System.Net.IPAddress]::Parse($Hostname), $Port
-    )
+    $Script:DogStatsDEndpoint = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($Hostname), $Port)
     Write-Host "[WSFC Monitor] DogStatsD target: ${Hostname}:${Port}" -ForegroundColor Cyan
 }
 
@@ -134,30 +104,10 @@ function Send-Metric {
     }
 }
 
-# =============================================================================
-# SECTION 2 - State Code Lookup Maps
-# =============================================================================
-
 $NodeStateMap    = @{ 0='up'; 1='down'; 2='paused'; 3='joining' }
-
-$ResStateMap     = @{
-    0='unknown';   1='inherited';         2='initializing'
-    3='online';    4='offline';           128='failed'
-    129='pending'; 130='offline_pending'; 131='online_pending'
-}
-
+$ResStateMap     = @{ 0='unknown'; 1='inherited'; 2='initializing'; 3='online'; 4='offline'; 128='failed'; 129='pending'; 130='offline_pending'; 131='online_pending' }
 $NetworkStateMap = @{ 0='down'; 1='partially_up'; 2='up'; 3='unreachable' }
-
 $NicStateMap     = @{ 0='unknown'; 1='unavailable'; 2='failed'; 3='unreachable'; 4='up' }
-
-# =============================================================================
-# SECTION 3 - Safe Property Reader
-# -----------------------------------------------------------------------------
-# PowerShell does NOT allow try/catch inline inside [pscustomobject]@{} literals.
-# The closing } of a catch block is mis-parsed as closing the hashtable.
-# All potentially-missing properties must be pre-read via this helper BEFORE
-# constructing any [pscustomobject] or hashtable.
-# =============================================================================
 
 function Read-Prop {
     param(
@@ -174,15 +124,6 @@ function Read-Prop {
     }
     return $Default
 }
-
-# =============================================================================
-# SECTION 4 - Data Collection: Cluster, Nodes, Quorum  (WMI / CIM)
-# -----------------------------------------------------------------------------
-# Core Group detection uses three-level fallback:
-#   Level 1: IsCoreGroup property (WS2016+)
-#   Level 2: GroupType -eq 1      (older versions)
-#   Level 3: Name like 'Cluster Group' (universal fallback)
-# =============================================================================
 
 function Get-ClusterCimData {
     param([string] $ComputerName = '')
@@ -204,22 +145,20 @@ function Get-ClusterCimData {
             return $null
         }
 
-        $nodes     = Get-CimInstance -Namespace ROOT\MSCluster -ClassName MSCluster_Node          @cimArgs
-        $groups    = Get-CimInstance -Namespace ROOT\MSCluster -ClassName MSCluster_ResourceGroup @cimArgs
-        $resources = Get-CimInstance -Namespace ROOT\MSCluster -ClassName MSCluster_Resource      @cimArgs |
-                     Select-Object Name, ResourceType, State, OwnerGroup, OwnerNode
+        $nodes     = @(Get-CimInstance -Namespace ROOT\MSCluster -ClassName MSCluster_Node          @cimArgs)
+        $groups    = @(Get-CimInstance -Namespace ROOT\MSCluster -ClassName MSCluster_ResourceGroup @cimArgs)
+        $resources = @(Get-CimInstance -Namespace ROOT\MSCluster -ClassName MSCluster_Resource      @cimArgs |
+                       Select-Object Name, ResourceType, State, OwnerGroup, OwnerNode)
 
-        $clusterIsUp = [bool]($nodes | Where-Object { $_.State -in @(0, 3) })
+        $clusterIsUp = (@($nodes | Where-Object { $_.State -in @(0, 3) }).Count -gt 0)
 
-        # Witness detection
         $witness = $null
         $qt = "$($cluster.QuorumType)"
-        if     ($qt -like '*File Share*') { $witness = $resources | Where-Object { $_.ResourceType -like '*File Share Witness*' } | Select-Object -First 1 }
-        elseif ($qt -like '*Disk*')       { $witness = $resources | Where-Object { $_.ResourceType -like '*Physical Disk*' -and ($_.OwnerGroup -like '*Cluster*' -or $_.OwnerGroup -like '*Core*') } | Select-Object -First 1 }
-        elseif ($qt -like '*Cloud*')      { $witness = $resources | Where-Object { $_.ResourceType -like '*Cloud Witness*' } | Select-Object -First 1 }
-        else                              { $witness = $resources | Where-Object { $_.ResourceType -like '*Witness*' } | Select-Object -First 1 }
+        if     ($qt -like '*File Share*') { $witness = @($resources | Where-Object { $_.ResourceType -like '*File Share Witness*' }) | Select-Object -First 1 }
+        elseif ($qt -like '*Disk*')       { $witness = @($resources | Where-Object { $_.ResourceType -like '*Physical Disk*' -and ($_.OwnerGroup -like '*Cluster*' -or $_.OwnerGroup -like '*Core*') }) | Select-Object -First 1 }
+        elseif ($qt -like '*Cloud*')      { $witness = @($resources | Where-Object { $_.ResourceType -like '*Cloud Witness*' }) | Select-Object -First 1 }
+        else                              { $witness = @($resources | Where-Object { $_.ResourceType -like '*Witness*' }) | Select-Object -First 1 }
 
-        # Pre-read witness properties BEFORE building any object (try/catch not allowed inside @{})
         $wState = 'none'; $wType = 'none'; $wName = 'none'; $wOwner = 'none'
         if ($null -ne $witness) {
             $wCode  = try { [int]$witness.State } catch { -1 }
@@ -229,38 +168,27 @@ function Get-ClusterCimData {
             $wOwner = try { if ($witness.OwnerNode) { ($witness.OwnerNode -replace '[^a-zA-Z0-9_\-]','_').ToLower() } else { 'none' } } catch { 'none' }
         }
 
-        # Core Group - three-level fallback
         $coreGroup = $null
-
-        # Level 1: IsCoreGroup (WS2016+)
-        try { $coreGroup = $groups | Where-Object { $_.IsCoreGroup -eq $true } | Select-Object -First 1 }
-        catch { Write-Verbose '[Get-ClusterCimData] IsCoreGroup not available, trying GroupType.' }
-
-        # Level 2: GroupType = 1
+        try { $coreGroup = @($groups | Where-Object { $_.IsCoreGroup -eq $true }) | Select-Object -First 1 } catch { Write-Verbose '[Get-ClusterCimData] IsCoreGroup not available, trying GroupType.' }
         if ($null -eq $coreGroup) {
-            try { $coreGroup = $groups | Where-Object { [int]$_.GroupType -eq 1 } | Select-Object -First 1 }
-            catch { Write-Verbose '[Get-ClusterCimData] GroupType not available, using name fallback.' }
+            try { $coreGroup = @($groups | Where-Object { [int]$_.GroupType -eq 1 }) | Select-Object -First 1 } catch { Write-Verbose '[Get-ClusterCimData] GroupType not available, using name fallback.' }
+        }
+        if ($null -eq $coreGroup) {
+            $coreGroup = @($groups | Where-Object { $_.Name -like '*Cluster Group*' -or $_.Name -like '*Core*' }) | Select-Object -First 1
         }
 
-        # Level 3: Name match
-        if ($null -eq $coreGroup) {
-            $coreGroup = $groups | Where-Object { $_.Name -like '*Cluster Group*' -or $_.Name -like '*Core*' } | Select-Object -First 1
-        }
-
-        # Pre-read core group state BEFORE building object
         $coreGroupState = 'not_found'
         if ($null -ne $coreGroup) {
             $cgCode         = try { [int]$coreGroup.State } catch { -1 }
             $coreGroupState = if ($ResStateMap.ContainsKey($cgCode)) { $ResStateMap[$cgCode] } else { 'unknown' }
         }
 
-        # Pre-read cluster name and quorum values
-        $clusterName    = try { [string]$cluster.Name }        catch { 'unknown' }
-        $quorumType     = try { ($cluster.QuorumType -replace '\s+','_').ToLower() } catch { 'unknown' }
-        $quorumTypeVal  = try { [int]$cluster.QuorumTypeValue } catch { 0 }
-        $nodesUp        = ($nodes | Where-Object { $_.State -eq 0 }).Count
-        $nodesDown      = ($nodes | Where-Object { $_.State -eq 1 }).Count
-        $nodesPaused    = ($nodes | Where-Object { $_.State -eq 2 }).Count
+        $clusterName   = try { [string]$cluster.Name } catch { 'unknown' }
+        $quorumType    = try { ($cluster.QuorumType -replace '\s+','_').ToLower() } catch { 'unknown' }
+        $quorumTypeVal = try { [int]$cluster.QuorumTypeValue } catch { 0 }
+        $nodesUp       = @($nodes | Where-Object { $_.State -eq 0 }).Count
+        $nodesDown     = @($nodes | Where-Object { $_.State -eq 1 }).Count
+        $nodesPaused   = @($nodes | Where-Object { $_.State -eq 2 }).Count
 
         return [pscustomobject]@{
             ClusterName     = $clusterName
@@ -287,19 +215,6 @@ function Get-ClusterCimData {
     }
 }
 
-# =============================================================================
-# SECTION 5 - Data Collection: Networks & Interfaces  (FailoverClusters module)
-# -----------------------------------------------------------------------------
-# FIX: try/catch CANNOT be used inside [pscustomobject]@{} hashtable literals.
-#      All property reads are pre-computed into local variables BEFORE
-#      the [pscustomobject] is constructed.
-#
-# FIX: .Node and .Network on ClusterNetworkInterface can be either:
-#      (a) An object with a .Name property  (newer cluster versions)
-#      (b) A plain string                   (older cluster versions)
-#      Read-Prop handles both safely.
-# =============================================================================
-
 function Get-ClusterNetworkData {
     param([string] $ComputerName = '')
 
@@ -312,61 +227,27 @@ function Get-ClusterNetworkData {
         $clusterObj  = Get-Cluster @clusterArgs -ErrorAction Stop | Select-Object -First 1
         $clusterName = Read-Prop -Obj $clusterObj -Names 'Name' -Default 'unknown-cluster'
 
-        # Network segments - all values pre-read before [pscustomobject]
-        $networks = Get-ClusterNetwork @clusterArgs -ErrorAction SilentlyContinue |
+        $networks = @(Get-ClusterNetwork @clusterArgs -ErrorAction SilentlyContinue) |
                     ForEach-Object {
-                        $netName   = try { [string]$_.Name }  catch { 'unknown' }
-                        $stateInt  = try { [int]$_.State }    catch { -1 }
-                        $stateLabel= if ($NetworkStateMap.ContainsKey($stateInt)) { $NetworkStateMap[$stateInt] } else { 'unknown' }
-                        $role      = try { ($_.Role).ToString().ToLower() } catch { 'unknown' }
-                        $metric    = try { [int]$_.Metric }   catch { 0 }
-
-                        [pscustomobject]@{
-                            Name       = $netName
-                            StateCode  = $stateInt
-                            StateLabel = $stateLabel
-                            Role       = $role
-                            Metric     = $metric
-                        }
+                        $netName    = try { [string]$_.Name }  catch { 'unknown' }
+                        $stateInt   = try { [int]$_.State }    catch { -1 }
+                        $stateLabel = if ($NetworkStateMap.ContainsKey($stateInt)) { $NetworkStateMap[$stateInt] } else { 'unknown' }
+                        $role       = try { ($_.Role).ToString().ToLower() } catch { 'unknown' }
+                        $metric     = try { [int]$_.Metric }   catch { 0 }
+                        [pscustomobject]@{ Name = $netName; StateCode = $stateInt; StateLabel = $stateLabel; Role = $role; Metric = $metric }
                     }
 
-        # Network interfaces - all values pre-read before [pscustomobject]
-        # Node/Network are handled via Read-Prop which covers both object and string types
-        $interfaces = Get-ClusterNetworkInterface @clusterArgs -ErrorAction SilentlyContinue |
+        $interfaces = @(Get-ClusterNetworkInterface @clusterArgs -ErrorAction SilentlyContinue) |
                       ForEach-Object {
-                          $ifName    = try { [string]$_.Name } catch { 'unknown' }
-                          $stateInt  = try { [int]$_.State }   catch { -1 }
-                          $stateLabel= if ($NicStateMap.ContainsKey($stateInt)) { $NicStateMap[$stateInt] } else { 'unknown' }
-                          $adapter   = try { [string]$_.Adapter } catch { 'unknown' }
-
-                          # .Node can be a string or an object - Read-Prop handles both
-                          $nodeRaw = try { $_.Node } catch { $null }
-                          $nodeName = if ($null -eq $nodeRaw) {
-                              'unknown'
-                          } elseif ($nodeRaw -is [string]) {
-                              $nodeRaw
-                          } else {
-                              Read-Prop -Obj $nodeRaw -Names 'Name' -Default 'unknown'
-                          }
-
-                          # .Network can be a string or an object - Read-Prop handles both
-                          $netRaw = try { $_.Network } catch { $null }
-                          $netName = if ($null -eq $netRaw) {
-                              'unknown'
-                          } elseif ($netRaw -is [string]) {
-                              $netRaw
-                          } else {
-                              Read-Prop -Obj $netRaw -Names 'Name' -Default 'unknown'
-                          }
-
-                          [pscustomobject]@{
-                              Name       = $ifName
-                              Node       = $nodeName
-                              Network    = $netName
-                              Adapter    = $adapter
-                              StateCode  = $stateInt
-                              StateLabel = $stateLabel
-                          }
+                          $ifName     = try { [string]$_.Name }    catch { 'unknown' }
+                          $stateInt   = try { [int]$_.State }      catch { -1 }
+                          $stateLabel = if ($NicStateMap.ContainsKey($stateInt)) { $NicStateMap[$stateInt] } else { 'unknown' }
+                          $adapter    = try { [string]$_.Adapter } catch { 'unknown' }
+                          $nodeRaw    = try { $_.Node }    catch { $null }
+                          $nodeName   = if ($null -eq $nodeRaw) { 'unknown' } elseif ($nodeRaw -is [string]) { $nodeRaw } else { Read-Prop -Obj $nodeRaw -Names 'Name' -Default 'unknown' }
+                          $netRaw     = try { $_.Network } catch { $null }
+                          $netName    = if ($null -eq $netRaw) { 'unknown' } elseif ($netRaw -is [string]) { $netRaw } else { Read-Prop -Obj $netRaw -Names 'Name' -Default 'unknown' }
+                          [pscustomobject]@{ Name = $ifName; Node = $nodeName; Network = $netName; Adapter = $adapter; StateCode = $stateInt; StateLabel = $stateLabel }
                       }
 
         return [pscustomobject]@{
@@ -381,95 +262,60 @@ function Get-ClusterNetworkData {
     }
 }
 
-# =============================================================================
-# SECTION 6 - Metric Submission
-# =============================================================================
-
 function Submit-WSFCMetrics {
     param([string] $ComputerName = '')
 
     Write-Host "[$([datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))] Collecting WSFC metrics..." -ForegroundColor DarkCyan
 
-    # ── Cluster, Node, Quorum ─────────────────────────────────────────────────
     $clusterData = Get-ClusterCimData -ComputerName $ComputerName
-
     if ($null -ne $clusterData) {
         $cn = ($clusterData.ClusterName -replace '[^a-zA-Z0-9_\-]','_').ToLower()
+        $clusterTags = @{ cluster_name = $cn; quorum_type = $clusterData.QuorumType; core_group_state = $clusterData.CoreGroupState }
 
-        $clusterTags = @{
-            cluster_name     = $cn
-            quorum_type      = $clusterData.QuorumType
-            core_group_state = $clusterData.CoreGroupState
-        }
-
-        Send-Metric -Name 'wsfc.cluster.health'        -Value ([int][bool]$clusterData.ClusterIsUp) -Tags $clusterTags
-        Send-Metric -Name 'wsfc.cluster.nodes.up'      -Value $clusterData.NodesUp                 -Tags $clusterTags
-        Send-Metric -Name 'wsfc.cluster.nodes.down'    -Value $clusterData.NodesDown               -Tags $clusterTags
-        Send-Metric -Name 'wsfc.cluster.nodes.paused'  -Value $clusterData.NodesPaused             -Tags $clusterTags
+        Send-Metric -Name 'wsfc.cluster.health'       -Value ([int][bool]$clusterData.ClusterIsUp) -Tags $clusterTags
+        Send-Metric -Name 'wsfc.cluster.nodes.up'     -Value $clusterData.NodesUp                 -Tags $clusterTags
+        Send-Metric -Name 'wsfc.cluster.nodes.down'   -Value $clusterData.NodesDown               -Tags $clusterTags
+        Send-Metric -Name 'wsfc.cluster.nodes.paused' -Value $clusterData.NodesPaused             -Tags $clusterTags
 
         $witnessHealth = if ($clusterData.WitnessState -eq 'online') { 1 } else { 0 }
-        Send-Metric -Name 'wsfc.quorum.witness.health' `
-                    -Value $witnessHealth `
-                    -Tags @{
-                        cluster_name       = $cn
-                        quorum_type        = $clusterData.QuorumType
-                        quorum_type_value  = [string]$clusterData.QuorumTypeValue
-                        witness_type       = $clusterData.WitnessType
-                        witness_name       = $clusterData.WitnessName
-                        witness_state      = $clusterData.WitnessState
-                        witness_owner_node = $clusterData.WitnessOwner
-                    }
+        Send-Metric -Name 'wsfc.quorum.witness.health' -Value $witnessHealth -Tags @{
+            cluster_name       = $cn
+            quorum_type        = $clusterData.QuorumType
+            quorum_type_value  = [string]$clusterData.QuorumTypeValue
+            witness_type       = $clusterData.WitnessType
+            witness_name       = $clusterData.WitnessName
+            witness_state      = $clusterData.WitnessState
+            witness_owner_node = $clusterData.WitnessOwner
+        }
 
         foreach ($node in $clusterData.Nodes) {
             $stateCode  = try { [int]$node.State } catch { -1 }
             $stateLabel = if ($NodeStateMap.ContainsKey($stateCode)) { $NodeStateMap[$stateCode] } else { 'unknown' }
             $nodeName   = ($node.Name -replace '[^a-zA-Z0-9_\-]','_').ToLower()
-
-            $nodeTags = @{
-                cluster_name = $cn
-                node_name    = $nodeName
-                node_state   = $stateLabel
-            }
-
+            $nodeTags   = @{ cluster_name = $cn; node_name = $nodeName; node_state = $stateLabel }
             Send-Metric -Name 'wsfc.node.health' -Value ([int]($stateCode -eq 0)) -Tags $nodeTags
             Send-Metric -Name 'wsfc.node.state'  -Value $stateCode                -Tags $nodeTags
         }
     }
 
-    # ── Network, Interface ────────────────────────────────────────────────────
     $netData = Get-ClusterNetworkData -ComputerName $ComputerName
-
     if ($null -ne $netData) {
         $cn = ($netData.ClusterName -replace '[^a-zA-Z0-9_\-]','_').ToLower()
 
         foreach ($net in $netData.Networks) {
             $netName = ($net.Name -replace '[^a-zA-Z0-9_\-]','_').ToLower()
-            $netTags = @{
-                cluster_name  = $cn
-                network_name  = $netName
-                network_role  = $net.Role
-                network_state = $net.StateLabel
-            }
+            $netTags = @{ cluster_name = $cn; network_name = $netName; network_role = $net.Role; network_state = $net.StateLabel }
             Send-Metric -Name 'wsfc.network.health' -Value ([int]($net.StateCode -eq 2)) -Tags $netTags
             Send-Metric -Name 'wsfc.network.state'  -Value $net.StateCode               -Tags $netTags
             Send-Metric -Name 'wsfc.network.metric' -Value $net.Metric                  -Tags $netTags
         }
 
         foreach ($nic in $netData.Interfaces) {
-            $nicName    = ($nic.Name    -replace '[^a-zA-Z0-9_\-]','_').ToLower()
-            $nodeName   = ($nic.Node    -replace '[^a-zA-Z0-9_\-]','_').ToLower()
-            $netName    = ($nic.Network -replace '[^a-zA-Z0-9_\-]','_').ToLower()
-            $adptrName  = ($nic.Adapter -replace '[^a-zA-Z0-9_\-]','_').ToLower()
-
-            $nicTags = @{
-                cluster_name    = $cn
-                node_name       = $nodeName
-                network_name    = $netName
-                adapter_name    = $adptrName
-                interface_name  = $nicName
-                interface_state = $nic.StateLabel
-            }
-
+            $nicName   = ($nic.Name    -replace '[^a-zA-Z0-9_\-]','_').ToLower()
+            $nodeName  = ($nic.Node    -replace '[^a-zA-Z0-9_\-]','_').ToLower()
+            $netName   = ($nic.Network -replace '[^a-zA-Z0-9_\-]','_').ToLower()
+            $adptrName = ($nic.Adapter -replace '[^a-zA-Z0-9_\-]','_').ToLower()
+            $nicTags   = @{ cluster_name = $cn; node_name = $nodeName; network_name = $netName; adapter_name = $adptrName; interface_name = $nicName; interface_state = $nic.StateLabel }
             Send-Metric -Name 'wsfc.network_interface.health' -Value ([int]($nic.StateCode -eq 4)) -Tags $nicTags
             Send-Metric -Name 'wsfc.network_interface.state'  -Value $nic.StateCode               -Tags $nicTags
         }
@@ -478,17 +324,8 @@ function Submit-WSFCMetrics {
     Write-Host "[$([datetime]::Now.ToString('HH:mm:ss'))] Metrics submitted." -ForegroundColor Green
 }
 
-# =============================================================================
-# SECTION 7 - Entry Point / 60-Second Run Loop
-# =============================================================================
-
 if (-not (Test-Prerequisites)) {
     Write-Host "[WSFC Monitor] Prerequisites not met. Please fix the issues above and re-run." -ForegroundColor Red
-    Write-Host ""
-    Write-Host "Quick fix commands (elevated PowerShell):" -ForegroundColor Yellow
-    Write-Host "  Install-WindowsFeature -Name Failover-Clustering -IncludeManagementTools" -ForegroundColor White
-    Write-Host "  Install-WindowsFeature -Name RSAT-Clustering-PowerShell" -ForegroundColor White
-    Write-Host "  Restart-Computer" -ForegroundColor White
     exit 1
 }
 

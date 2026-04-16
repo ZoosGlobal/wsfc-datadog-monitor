@@ -5,6 +5,7 @@
 
 .DESCRIPTION
     Collects Windows Server Failover Cluster metrics and sends them to DogStatsD.
+    Designed to run once per scheduled-task invocation.
     Monitors:
       - Cluster presence / health
       - All cluster node state / health / weight
@@ -19,8 +20,7 @@
 param(
     [string] $DogStatsDHost = '127.0.0.1',
     [int]    $DogStatsDPort = 8125,
-    [string] $ComputerName  = '',
-    [switch] $RunOnce
+    [string] $ComputerName  = ''
 )
 
 Set-StrictMode -Version Latest
@@ -436,15 +436,11 @@ function Submit-WSFCMetrics {
 
     $csvItems = @(Get-ClusterCsvData -ComputerName $ComputerName)
     foreach ($csv in $csvItems) {
-        $csvName = Sanitize-TagValue $csv.Name
-        $csvOwner = Sanitize-TagValue $csv.OwnerNode
-        $csvStateText = Sanitize-TagValue $csv.State
-
         $csvTags = @{
             cluster_name = $cn
-            csv_name     = $csvName
-            owner_node   = $csvOwner
-            csv_state    = $csvStateText
+            csv_name     = Sanitize-TagValue $csv.Name
+            owner_node   = Sanitize-TagValue $csv.OwnerNode
+            csv_state    = Sanitize-TagValue $csv.State
         }
 
         $csvHealth = 0
@@ -491,23 +487,13 @@ function Submit-WSFCMetrics {
     }
 }
 
-if (-not (Test-Prerequisites)) { exit 1 }
-
-Initialize-DogStatsDClient -Hostname $DogStatsDHost -Port $DogStatsDPort
-
 try {
-    if ($RunOnce) {
-        Submit-WSFCMetrics -ComputerName $ComputerName
+    if (-not (Test-Prerequisites)) {
+        exit 1
     }
-    else {
-        while ($true) {
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            Submit-WSFCMetrics -ComputerName $ComputerName
-            $sw.Stop()
-            $sleepMs = [Math]::Max(0, 60000 - $sw.ElapsedMilliseconds)
-            Start-Sleep -Milliseconds $sleepMs
-        }
-    }
+
+    Initialize-DogStatsDClient -Hostname $DogStatsDHost -Port $DogStatsDPort
+    Submit-WSFCMetrics -ComputerName $ComputerName
 }
 finally {
     if ($Script:UdpClient) {
